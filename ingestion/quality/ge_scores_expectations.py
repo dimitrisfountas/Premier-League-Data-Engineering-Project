@@ -1,34 +1,70 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
 import pandas as pd
-from .expectations import BaseQA
+from great_expectations import expectations as gxe
+
+from ingestion.quality.expectations import BaseQA
+
 
 class ScoresQA(BaseQA):
-    """QA class for Scores dataset, includes scores-specific checks."""
+    """Great Expectations suite for score records and fixture referential integrity."""
 
-    def __init__(self, df: pd.DataFrame, expected_columns: set):
-        """
-        Parameters
-        ----------
-        df : pd.DataFrame
-            Scores dataset
-        expected_columns : set
-            Columns that should exist in scores dataset
-        """
-        super().__init__(df, expected_columns)  # Initialize BaseQA
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        expected_columns: set[str],
+        schedule_game_ids: set[str],
+        data_docs_dir: str | Path | None = None,
+    ):
+        super().__init__(df, expected_columns, data_docs_dir=data_docs_dir)
+        self.schedule_game_ids = schedule_game_ids
 
-    def run_all_checks(self):
-        """Run all checks for the scores dataset."""
+    def run_all_checks(self) -> list[dict[str, Any]]:
+        expectations = self.column_expectations()
+        columns = set(self.df.columns)
 
-        # Base checks
-        self.results.append(self.check_columns(store_result=False))
-        self.results.append(self.check_nulls(store_result=False))
-        self.results.append(self.check_unique("game_id", store_result=False))
-        
+        if "game_id" in columns:
+            expectations.append(
+                gxe.ExpectColumnValuesToBeUnique(column="game_id")
+            )
+            if self.schedule_game_ids:
+                # This is the score-to-schedule foreign-key check: an orphan
+                # score ID fails before any score data reaches analytics.
+                expectations.append(
+                    gxe.ExpectColumnValuesToBeInSet(
+                        column="game_id",
+                        value_set=sorted(self.schedule_game_ids),
+                    )
+                )
+        for column in ("home_goals", "away_goals"):
+            if column in columns:
+                expectations.append(
+                    gxe.ExpectColumnValuesToBeBetween(
+                        column=column,
+                        min_value=0,
+                    )
+                )
+        if "ingestion_time" in columns:
+            expectations.append(
+                gxe.ExpectColumnValuesToMatchStrftimeFormat(
+                    column="ingestion_time",
+                    strftime_format="%Y-%m-%dT%H:%M:%SZ",
+                )
+            )
+        if self.schedule_game_ids:
+            # With unique, non-null IDs restricted to the schedule set, matching
+            # this count proves every scheduled fixture has exactly one score.
+            expectations.append(
+                gxe.ExpectTableRowCountToEqual(
+                    value=len(self.schedule_game_ids)
+                )
+            )
 
-        # Scores-specific checks
-        self.results.append(self.check_min_value("home_goals", 0, store_result=False))
-        self.results.append(self.check_min_value("away_goals", 0, store_result=False))
-
-        # ISO timestamp for ingestion_time
-        self.results.append(self.check_iso_timestamp("ingestion_time", store_result=False))
-
-        return self.results
+        return self.validate(
+            suite_name="premier_league_scores",
+            dataframe=self.df,
+            expectations=expectations,
+        )

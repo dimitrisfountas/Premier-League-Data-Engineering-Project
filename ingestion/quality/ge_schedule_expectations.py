@@ -1,68 +1,87 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
 import pandas as pd
-from .expectations import BaseQA
+from great_expectations import expectations as gxe
+
+from ingestion.quality.expectations import BaseQA
+
 
 class ScheduleQA(BaseQA):
-    """QA class for Schedule dataset, includes schedule-specific checks."""
+    """Great Expectations suite for schedule records and team-round integrity."""
 
-    def __init__(self, df: pd.DataFrame, expected_columns: set, valid_teams: set):
-        """
-        Parameters
-        ----------
-        df : pd.DataFrame
-            Schedule DataFrame
-        expected_columns : set
-            Columns that should exist in schedule dataset
-        valid_teams : set
-            Set of valid team names
-        """
-        super().__init__(df, expected_columns)  # Initialize BaseQA
-        self.valid_teams = valid_teams  # Store valid teams
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        expected_columns: set[str],
+        valid_teams: set[str],
+        data_docs_dir: str | Path | None = None,
+    ):
+        super().__init__(df, expected_columns, data_docs_dir=data_docs_dir)
+        self.valid_teams = valid_teams
 
-    def team_must_be_in_set(self, col: str):
-        """
-        Check that all values in a team column are in the valid team set.
+    def run_all_checks(self) -> list[dict[str, Any]]:
+        expectations = self.column_expectations()
+        columns = set(self.df.columns)
 
-        Parameters
-        ----------
-        col : str
-            Column name (home_team or away_team)
-        """
-        failed_values = self.df.loc[~self.df[col].isin(self.valid_teams), col].tolist()
-        return {
-            "expectation": f"expect_column_values_to_be_in_set:{col}",
-            "success": len(failed_values) == 0,
-            "result": {"failed_for": failed_values, "failed_count": len(failed_values)}
-        }
+        if "game_id" in columns:
+            expectations.append(
+                gxe.ExpectColumnValuesToBeUnique(column="game_id")
+            )
+        if "round" in columns:
+            expectations.append(
+                gxe.ExpectColumnValuesToBeBetween(
+                    column="round",
+                    min_value=1,
+                    max_value=38,
+                )
+            )
+        for column in ("home_team", "away_team"):
+            if column in columns:
+                expectations.append(
+                    gxe.ExpectColumnValuesToBeInSet(
+                        column=column,
+                        value_set=sorted(self.valid_teams),
+                    )
+                )
+        if "game_start_time" in columns:
+            expectations.append(
+                gxe.ExpectColumnValuesToMatchStrftimeFormat(
+                    column="game_start_time",
+                    strftime_format="%Y-%m-%dT%H:%M:%SZ",
+                )
+            )
 
-    def expect_one_match_per_team_per_round(self):
-        """
-        Each team must play at most once per round.
-        """
-        all_matches = pd.concat([
-            self.df[["round", "home_team"]].rename(columns={"home_team": "team"}),
-            self.df[["round", "away_team"]].rename(columns={"away_team": "team"})
-        ])
-        duplicates = all_matches.duplicated(subset=["round", "team"], keep=False)
-        return {
-            "expectation": "one_match_per_team_per_round",
-            "success": not duplicates.any(),
-            "result": {
-                "failed_for": all_matches.loc[duplicates].to_dict(orient="records"),
-                "failed_count": int(duplicates.sum() / 2)
-            }
-        }
+        results = self.validate(
+            suite_name="premier_league_schedule",
+            dataframe=self.df,
+            expectations=expectations,
+        )
 
-    def run_all_checks(self):
-        """Run all checks for the schedule dataset."""
-        # Base checks
-        self.results.append(self.check_columns(store_result=False))
-        self.results.append(self.check_nulls(store_result=False))
-        self.results.append(self.check_unique("game_id", store_result=False))
-        self.results.append(self.check_iso_timestamp("game_start_time", store_result=False))
-        self.results.append(self.check_between("round", 1, 38, store_result=False))
-
-        # Schedule-specific checks
-        for col in ["home_team", "away_team"]:
-            self.results.append(self.team_must_be_in_set(col))
-        self.results.append(self.expect_one_match_per_team_per_round())
-        return self.results
+        if {"round", "home_team", "away_team"}.issubset(columns):
+            # Convert home/away sides into one team-per-round table so a team
+            # appearing once on each side still violates compound uniqueness.
+            appearances = pd.concat(
+                [
+                    self.df[["round", "home_team"]].rename(
+                        columns={"home_team": "team"}
+                    ),
+                    self.df[["round", "away_team"]].rename(
+                        columns={"away_team": "team"}
+                    ),
+                ],
+                ignore_index=True,
+            )
+            appearance_results = self.validate(
+                suite_name="premier_league_team_round_appearances",
+                dataframe=appearances,
+                expectations=[
+                    gxe.ExpectCompoundColumnsToBeUnique(
+                        column_list=["round", "team"]
+                    )
+                ],
+            )
+            results.extend(appearance_results)
+        return results

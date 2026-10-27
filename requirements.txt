@@ -1,1 +1,2 @@
 pandas
+great-expectations==1.24.1
