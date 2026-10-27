@@ -229,6 +229,7 @@ class FormAnalyzer:
         # Save to CSV: 117 rows (3 teams × 39 Mondays)
         output_df.to_csv(self.output_path, index=False)
         logger.info(f"Saved {len(output_df)} results to {self.output_path}")
+        return output_df
 
 
 if __name__ == "__main__":
@@ -241,4 +242,3 @@ if __name__ == "__main__":
     # Run the form analysis: loads standings_historical.csv and exports recent_form.csv
     analyzer = FormAnalyzer()
     analyzer.run()
-
