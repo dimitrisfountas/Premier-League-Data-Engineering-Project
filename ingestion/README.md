@@ -25,18 +25,18 @@ csv_ingestor.py
     ↓
 Normalized DataFrame
     ↓
-quality/ (Validation Rules)
-├─ expectations.py (BaseQA class with common checks)
-├─ ge_schedule_expectations.py (Schedule-specific validation)
-└─ ge_scores_expectations.py (Scores-specific validation)
+quality/ (Great Expectations suites)
+├─ expectations.py (GX pandas validation and Data Docs rendering)
+├─ ge_schedule_expectations.py (Schedule suite)
+└─ ge_scores_expectations.py (Scores and fixture-integrity suite)
     ↓
 Validation Results
     ↓
 pipeline/ (Orchestration)
 ├─ pipeline.py (DataPipelineCSV class)
 ├─ Runs validation checks
-├─ If failures: Apply remediation
-├─ Re-validate after fixes
+├─ Apply explicit score remediation policies where enabled
+├─ Re-validate and fail closed on critical expectation failures
 └─ Pass validated DataFrame downstream
     ↓
 audit/ (Audit Trail)
@@ -90,16 +90,14 @@ df = ingestor.get_dataframe()
 
 **Base Class**: `expectations.py` → `BaseQA`
 
-Common validation methods available to all datasets:
+The project uses the actual `great-expectations` library (GX 1.24.1) with
+in-memory pandas DataFrames, `ExpectationSuite`, and `ValidationDefinition`.
+Each validation runs in an ephemeral GX context; no database or persistent GX
+project configuration is required.
 
-| Method | Description | Example |
-|--------|-------------|---------|
-| `check_columns()` | Verify exact column set | Ensures no extra/missing columns |
-| `check_nulls()` | Find columns with null values | Flags data completeness issues |
-| `check_unique(col)` | Verify column has unique values | Validates `game_id` uniqueness |
-| `check_iso_timestamp(col)` | Validate ISO-8601 format | Checks `game_start_time` |
-| `check_between(col, min, max)` | Verify numeric range | Validates `round` is 1-38 |
-| `check_min_value(col, min)` | Verify minimum threshold | Ensures goals >= 0 |
+Suite results, including the GX expectation configuration, severity,
+unexpected values, and exception details, are retained in the append-only CSV
+audit logs. GX Data Docs are built under `logs/validation/data_docs/`.
 
 #### Schedule Validation: `ge_schedule_expectations.py` → `ScheduleQA`
 
@@ -110,6 +108,7 @@ Specific checks for schedule dataset:
 - `game_start_time` must be ISO-8601 format
 - `round` must be between 1 and 38
 - Business rule: Each team plays at most once per round
+- Home and away teams must be in the configured Premier League team set
 
 #### Scores Validation: `ge_scores_expectations.py` → `ScoresQA`
 
@@ -118,6 +117,8 @@ Specific checks for scores dataset:
 - `game_id` must be unique
 - `home_goals` and `away_goals` must be >= 0
 - `ingestion_time` must be ISO-8601 format
+- Every score ID must refer to a scheduled fixture
+- The unique score count must equal the number of scheduled fixtures
 
 **Usage**:
 ```python
@@ -125,7 +126,7 @@ from ingestion.quality.ge_schedule_expectations import ScheduleQA
 
 qa = ScheduleQA(df, expected_columns, valid_teams)
 results = qa.run_all_checks()
-# Returns list of dicts with expectation results
+# Returns Great Expectations results adapted for the audit CSVs.
 ```
 
 ---
@@ -137,9 +138,10 @@ results = qa.run_all_checks()
 **Purpose**: Orchestrate the complete ingestion workflow:
 1. Ingest and normalize raw data
 2. Validate against quality rules
-3. If failures: Apply remediation rules
+3. If configured score failures: Apply explicit remediation rules
 4. Re-validate after fixes
-5. Log all results to audit trail
+5. Quarantine removed rows and log all results
+6. Raise `DataQualityError` if any critical expectation still fails
 
 **Workflow**:
 
@@ -154,9 +156,12 @@ results = qa.run_all_checks()
    
 3. Log pre-remediation results to audit trail
    
-4. handle_failed_expectations() [IF failures exist]
-   ├─ Drop rows with null values
-   └─ Remove duplicate game_ids (keep first)
+4. handle_failed_expectations() [scores only]
+   ├─ Collapse duplicates with identical goal results
+   ├─ Remove incomplete duplicates only when a compatible complete result exists
+   ├─ Quarantine conflicting game IDs
+   ├─ Quarantine IDs missing from the fixture schedule
+   └─ Quarantine remaining missing required values
    
 5. run_validations() [PASS 2: Post-remediation]
    └─ Re-validates to ensure fixes worked
@@ -169,14 +174,23 @@ results = qa.run_all_checks()
 ```python
 from ingestion.pipeline.pipeline import DataPipelineCSV
 
-pipeline = DataPipelineCSV("schedule", enable_remediation=True)
+pipeline = DataPipelineCSV("schedule")
 df, results, summary = pipeline.run_pipeline()
 # Returns: validated DataFrame, raw results, formatted summary
+
+# Validate scores against the already validated fixture IDs.
+score_pipeline = DataPipelineCSV(
+    "scores",
+    enable_remediation=True,
+    schedule_game_ids=set(df["game_id"].astype(str)),
+)
 ```
 
 **Parameters**:
 - `dataset_name`: "schedule" or "scores"
-- `enable_remediation`: True to fix issues, False for validation-only
+- `enable_remediation`: Enables only the documented score policies; it is not a
+  general-purpose drop-invalid-rows switch.
+- `schedule_game_ids`: Required for scores so GX can enforce referential integrity.
 
 **Output**:
 - Validated DataFrame (in memory)
@@ -191,7 +205,7 @@ df, results, summary = pipeline.run_pipeline()
 
 **Purpose**: Persist validation results to CSV files for audit trail and debugging.
 
-**Produces Two Output Files Per Dataset**:
+**Produces Validation Reports and an optional Quarantine File**:
 
 #### 1. Summary CSV (`logs/validation/{dataset}_validation_summary.csv`)
 **One row per expectation per run**
@@ -200,7 +214,7 @@ Columns:
 - `source`: Dataset name (schedule/scores)
 - `expectation`: Validation check name
 - `success`: Boolean (True/False)
-- `validation_stage`: "pre-remediation" or "post-remediation"
+- `validation_stage`: "validation", "pre-remediation", or "post-remediation"
 - `validation_run_at`: Timestamp of validation run
 
 **Purpose**: Quick overview of pass/fail status at each stage
@@ -214,6 +228,19 @@ Columns:
 - `validation_stage`: Stage identifier
 
 **Purpose**: Detailed audit trail for investigation
+
+#### Quarantine CSV (`logs/validation/{dataset}_quarantine.csv`)
+
+When score remediation removes records, this append-only file preserves the
+original row, its `quarantine_reason`, and `quarantined_at`. Rows whose
+`game_id` is not present in the authoritative schedule are marked
+`orphan_score_game_id`.
+
+#### Great Expectations Data Docs
+
+Each suite run creates native GX HTML Data Docs beneath
+`logs/validation/data_docs/{dataset}/{stage}_{run_timestamp}/{suite_name}/`.
+Open its `index.html` in a browser to inspect the suite and validation results.
 
 **Usage**:
 ```python
@@ -305,14 +332,14 @@ logs/pipeline/
 
 ## Data Quality Assurance Levels
 
-The ingestion module enforces quality at three levels:
+The ingestion module separates four responsibilities:
 
 | Level | Component | Responsibility |
 |-------|-----------|-----------------|
 | **L1: Normalization** | CSVIngestor | Trim whitespace, title case, metadata |
 | **L2: Validation** | quality/* | Check business rules (nulls, uniqueness, ranges) |
-| **L3: Remediation** | pipeline/* | Fix known issues (drop nulls, remove duplicates) |
-| **L4: Audit** | audit/* | Log all results for traceability |
+| **L3: Remediation** | pipeline/* | Apply explicit score policies and quarantine removed rows |
+| **L4: Audit** | audit/* | Append GX results and quarantine decisions for traceability |
 
 ---
 
@@ -342,16 +369,18 @@ STEP 2    STEP 3
 
 ## Error Handling
 
-If validation fails and remediation is enabled:
-1. Affected rows are logged to console/file
-2. Specific remediation rules are applied
-3. Re-validation confirms fixes
-4. All changes are tracked in audit logs
+If score validation fails and remediation is enabled:
+1. Pre-remediation GX results are written to the validation audit log
+2. The documented score policies remove only duplicates with consistent results
+3. Conflicts, orphan IDs, and unresolved incomplete rows go to the quarantine CSV
+4. The remediated DataFrame is revalidated and the result is logged
 
 If validation fails and remediation is disabled:
-1. Pipeline continues with unmodified data
-2. Failures are logged for manual review
-3. Downstream steps receive unvalidated data (proceed with caution)
+1. GX results are written to the validation audit log
+2. `DataQualityError` stops the pipeline before downstream processing
+
+Any critical expectation that still fails after remediation also raises
+`DataQualityError`; failed data is never returned as validated output.
 
 ---
 

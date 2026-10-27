@@ -10,12 +10,12 @@ Complete end-to-end data engineering solution for Premier League football analyt
 
 ```
 Raw CSV Data → Validation → Historical Analysis → Form Analysis → Final Standings
-(380 games)                (39 snapshots)       (SQL-based)     (Season totals)
+(380 games)                (38 snapshots)       (SQL-based)     (Season totals)
 ```
 
 **Execution Time**: ~5-10 seconds  
-**Output Files**: 6 deliverables across 3 steps  
-**Processors**: Python, pandas, SQLite
+**Output Files**: Analytics, validation, and quarantine reports
+**Processors**: Python, pandas, Great Expectations, SQLite
 
 ---
 
@@ -24,13 +24,24 @@ Raw CSV Data → Validation → Historical Analysis → Form Analysis → Final 
 ### Run the Complete Pipeline
 
 ```bash
+pip install -r requirements.txt
 python main.py
 ```
 
 **Output:**
 - Console: Progress updates, status messages, sample results
 - File: `logs/pipeline/pipeline_YYYYMMDD_HHMMSS.log` (detailed debug log)
-- Deliverables: 6 CSV files in `outputs/` and `logs/` directories
+- Deliverables: Analytics CSVs, validation/quarantine audit CSVs, and GX HTML Data Docs
+
+### Run the Automated Checks
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The integration test runs the complete pipeline in a temporary working
+directory and verifies output counts, orphan-score reconciliation, and GX HTML
+Data Docs generation.
 
 ### Expected Console Output
 
@@ -54,8 +65,8 @@ Validating SCORES...
 ================================================================================
 STEP 2: HISTORICAL STANDINGS SIMULATION
 ================================================================================
-Simulating weekly pipeline runs from Aug 25, 2025 to May 18, 2026
-Status: 39 Monday snapshots x 20 teams = 780 historical records
+Simulating weekly pipeline runs from Aug 25, 2025 to May 11, 2026
+Status: 38 Monday snapshots x 20 teams = 760 historical records
 [OK] Historical standings simulation completed successfully
 
 ================================================================================
@@ -103,17 +114,16 @@ PIPELINE EXECUTION COMPLETED
 
 **Process**:
 1. **Ingestion**: Load CSV files into pandas DataFrames
-2. **Validation**: Run 12+ validation checks
-   - Null values detection
-   - Duplicate rows detection
-   - Data type validation
-   - Value range validation
-   - Logical consistency checks
-3. **Remediation**: If tests fail
-   - Drop rows with nulls
-   - Remove exact duplicates
-   - Revalidate after fixes
-4. **Storage**: Keep validated DataFrames in memory for downstream steps
+2. **Validation**: Run Great Expectations suites against the pandas DataFrames
+   - Schema, nullability, unique IDs, timestamps, team membership, and ranges
+   - Team-round uniqueness and score-to-schedule ID integrity
+   - Verify exactly one score per scheduled fixture
+3. **Remediation**: Apply documented score-only policies
+   - Collapse duplicate fixture rows only when their scores agree
+   - Prefer a complete score over a compatible incomplete duplicate
+   - Quarantine conflicting, incomplete, and orphan records with reasons
+   - Revalidate; unresolved critical failures stop the pipeline
+4. **Storage**: Keep validated DataFrames in memory and render Great Expectations HTML Data Docs
 
 **Output**:
 ```
@@ -121,7 +131,9 @@ logs/validation/
 ├── schedule_validation_summary.csv    (Passed/Failed counts)
 ├── schedule_validation_full.csv       (Detailed results)
 ├── scores_validation_summary.csv      (Passed/Failed counts)
-└── scores_validation_full.csv         (Detailed results)
+├── scores_validation_full.csv         (Detailed results)
+├── scores_quarantine.csv              (Rows excluded with remediation reasons)
+└── data_docs/                         (Great Expectations HTML reports per suite/run)
 ```
 
 **Sample Validation Summary**:
@@ -142,12 +154,12 @@ schedule.date_format_iso8601                1       1       0
 
 ### STEP 2: Historical Standings Simulation
 
-**Purpose**: Calculate league standings at 39 key points in time (every Monday)
+**Purpose**: Calculate league standings at 38 key points in time (every Monday)
 
 **Input**: Validated schedule and scores DataFrames from STEP 1
 
 **Process**:
-1. **Iterate through 39 Mondays** (Aug 25, 2025 → May 18, 2026)
+1. **Iterate through 38 Mondays** (Aug 25, 2025 → May 11, 2026)
 2. **For each Monday**:
    - Filter matches where kickoff ≤ Monday 23:59:59 UTC
    - Calculate cumulative standings:
@@ -155,11 +167,11 @@ schedule.date_format_iso8601                1       1       0
      - Goals for, goals against (totals)
      - Points (wins×3 + draws)
    - Rank teams by: Points DESC → Goal Diff DESC → Goals For DESC
-3. **Aggregate**: Stack all 39 snapshots into single file
+3. **Aggregate**: Stack all 38 snapshots into single file
 
 **Output**:
 ```
-outputs/standings_historical.csv (780 rows)
+outputs/standings_historical.csv (760 rows)
 ```
 
 **Schema**:
@@ -169,14 +181,14 @@ ranking,team,wins,draws,losses,goals_for,goals_against,points,updated_at
 2,Liverpool,5,0,1,18,5,15,2025-08-25T08:00:00Z
 3,Newcastle,4,1,1,16,6,13,2025-08-25T08:00:00Z
 ...
-1,Manchester City,38,10,0,111,33,124,2026-05-18T08:00:00Z
-2,Liverpool,36,8,4,109,41,116,2026-05-18T08:00:00Z
+1,Manchester City,38,10,0,111,33,124,2026-05-11T08:00:00Z
+2,Liverpool,36,8,4,109,41,116,2026-05-11T08:00:00Z
 ...
 ```
 
 **Key Features**:
-- 39 weekly snapshots (39 Mondays)
-- 20 teams per snapshot (780 total rows)
+- 38 weekly snapshots (38 Mondays)
+- 20 teams per snapshot (760 total rows)
 - Chronological progression from season start to end
 - Cumulative metrics (totals increase over time)
 
@@ -328,9 +340,9 @@ form_ranking,team,goals_for,goals_against,points,updated_at
     │ STEP 2  │        │ STEP 3   │              │  STEP 4      │
     │History │        │ Final    │              │  Form        │
     │Standings│        │Standings │              │  Analysis    │
-    │ (39 wks)│        │(380 games)│             │ (SQLite)     │
+    │ (38 wks)│        │(380 games)│             │ (SQLite)     │
     │         │        │          │              │              │
-    │780 rows │        │20 rows   │              │114 rows      │
+    │760 rows │        │20 rows   │              │114 rows      │
     │         │        │          │              │              │
     └────┬────┘        └────┬─────┘              └──────┬───────┘
          │                  │                          │
@@ -353,7 +365,7 @@ data-engineer-assessment/
 │   ├── schedule.csv                     (Input: 380 matches)
 │   └── scores.csv                       (Input: 380 match results)
 ├── outputs/
-│   ├── standings_historical.csv         (STEP 2: 780 rows)
+│   ├── standings_historical.csv         (STEP 2: 760 rows)
 │   ├── standings_final.csv              (STEP 3: 20 rows)
 │   └── recent_form.csv                  (STEP 4: ~114 rows)
 ├── logs/
@@ -481,6 +493,7 @@ Contains:
 
 ```
 pandas          - DataFrames and CSV I/O
+great-expectations - Data validation suites and results
 sqlite3         - Built-in SQL engine (no install needed)
 logging         - Built-in logging framework
 pathlib         - File path utilities
@@ -510,7 +523,7 @@ data/scores.csv      - Match goals, results
 |--------|-------|
 | Total Execution Time | 5-10 seconds |
 | STEP 1 (Validation) | ~1 second |
-| STEP 2 (Historical) | ~2-3 seconds (39 iterations) |
+| STEP 2 (Historical) | ~2-3 seconds (38 iterations) |
 | STEP 3 (Final) | ~1 second |
 | STEP 4 (Form) | ~2-3 seconds (SQLite queries) |
 
@@ -544,12 +557,13 @@ Only file logs (no console spam).
 
 | File | Rows | Purpose |
 |------|------|---------|
-| standings_historical.csv | 780 | Week-by-week league progression |
+| standings_historical.csv | 760 | Week-by-week league progression |
 | standings_final.csv | 20 | Final season standings & champion |
 | recent_form.csv | ~114 | Top 3 teams by last 5 matches each week |
-| Validation logs (4 files) | Varies | Data quality audit trail |
+| Validation logs (4 files) | Varies | Great Expectations audit trail |
+| scores_quarantine.csv | Varies | Rows excluded with auditable reasons |
 
-**Total**: 6 CSV files + 1 detailed log file
+Great Expectations HTML Data Docs are generated under `logs/validation/data_docs/`.
 
 ---
 
@@ -619,7 +633,7 @@ Edit respective pipeline files:
 **Cause**: Missing Python packages  
 **Fix**: Install dependencies
 ```bash
-pip install pandas
+pip install -r requirements.txt
 ```
 
 ### "FileNotFoundError: data/schedule.csv"
