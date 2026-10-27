@@ -17,8 +17,8 @@ PIPELINE EXECUTION SERIES:
                                    ↓
 ┌─ STEP 2: HISTORICAL STANDINGS SIMULATION ───────────────────────────────┐
 │ INPUT:  Validated schedule & scores DataFrames from STEP 1              │
-│ PROCESS: Calculate standings at 39 weekly snapshots (Aug 25 - May 18)   │
-│ OUTPUT:  outputs/standings_historical.csv (780 rows = 39 weeks × 20)    │
+│ PROCESS: Calculate standings at 38 weekly snapshots (Aug 25 - May 11)   │
+│ OUTPUT:  outputs/standings_historical.csv (760 rows = 38 weeks × 20)    │
 │ PURPOSE: Show league progression over time                              │
 │ FILES:   analytics/historical_standings_pipeline.py                     │
 │          analytics/historical_standings_calculator.py                   │
@@ -179,7 +179,7 @@ def main():
     SERIES OF EXECUTION:
     1. Setup logging (initialize log files)
     2. STEP 1: Data Validation & Remediation (schedule & scores)
-    3. STEP 2: Historical Standings Simulation (39 weekly snapshots)
+    3. STEP 2: Historical Standings Simulation (38 weekly snapshots)
     4. STEP 4: Recent Form Analysis (SQL, top 3 teams per week)
     5. STEP 3: Final Standings Calculation (final season rankings)
     6. Summary report and deliverables list
@@ -205,14 +205,11 @@ def main():
     # PURPOSE: Ensure input data is clean before downstream processing
     # 
     # PROCESS:
-    # 1. Load CSV files (schedule.csv, scores.csv)
-    # 2. Run validation checks (null values, duplicates, type validation)
-    # 3. If checks fail:
-    #    a. Apply remediation (drop nulls, remove duplicates)
-    #    b. Re-validate
-    #    c. Store results
-    # 4. If checks pass: Skip remediation
-    # 5. Store validated DataFrames in memory for STEP 2 & 3
+    # 1. Validate the schedule and keep its fixture IDs as the score reference set.
+    # 2. Validate scores with Great Expectations against that authoritative set.
+    # 3. Quarantine only score rows covered by explicit remediation policies.
+    # 4. Stop before analytics if any critical expectation still fails.
+    # 5. Pass only post-validation DataFrames to downstream steps.
     #
     # OUTPUT: logs/validation/*.csv with test results
     # ════════════════════════════════════════════════════════════════════════════
@@ -222,59 +219,30 @@ def main():
     logger.info("Processing schedule and scores datasets...")
     logger.info("Status: Ingestion -> Validation -> Remediation")
     
-    datasets = ["schedule", "scores"]
     validated_data = {}
-    
-    for dataset_name in datasets:
+
+    for dataset_name in ("schedule", "scores"):
         logger.info(f"\nValidating {dataset_name.upper()}...")
-        
         try:
-            # Initialize pipeline component for this dataset
-            pipeline = DataPipelineCSV(dataset_name, enable_remediation=True)
-            
-            # Run complete validation + remediation workflow
+            if dataset_name == "schedule":
+                pipeline = DataPipelineCSV(dataset_name)
+            else:
+                # The validated fixture IDs are the authoritative foreign-key set
+                # used by the score suite to reject orphan match results.
+                schedule_game_ids = set(
+                    validated_data["schedule"]["game_id"].dropna().astype(str)
+                )
+                pipeline = DataPipelineCSV(
+                    dataset_name,
+                    enable_remediation=True,
+                    schedule_game_ids=schedule_game_ids,
+                )
+
             df, _, _ = pipeline.run_pipeline()
-            
-            # Store validated dataframe in memory for downstream use
             validated_data[dataset_name] = df
-            
-            # Read validation log to show what failed and was fixed
-            log_file = Path("logs/validation") / f"{dataset_name}_validation_full.csv"
-            if log_file.exists():
-                try:
-                    val_df = pd.read_csv(log_file)
-                    
-                    # Check if validation_stage column exists (skip if old format)
-                    if "validation_stage" not in val_df.columns:
-                        logger.info(f"Validation completed (validation logs need regeneration)")
-                        continue
-                    
-                    # Show pre-remediation failures (unique)
-                    pre_failures = val_df[
-                        (val_df["validation_stage"] == "pre-remediation") & 
-                        (val_df["success"].astype(str).str.lower() == "false")
-                    ]["expectation"].unique()
-                    
-                    if len(pre_failures) > 0:
-                        logger.warning(f"\nIssues detected before remediation:")
-                        for exp in pre_failures:
-                            logger.warning(f"  - {exp}")
-                        
-                        # Check if they were fixed
-                        post_failures = val_df[
-                            (val_df["validation_stage"] == "post-remediation") & 
-                            (val_df["success"].astype(str).str.lower() == "false")
-                        ]["expectation"].unique()
-                        
-                        fixed = len(pre_failures) - len(post_failures)
-                        if fixed > 0:
-                            logger.info(f"Remediation fixed {fixed} issue(s)")
-                    else:
-                        logger.info(f"No issues found")
-                except Exception as e:
-                    logger.warning(f"Could not parse validation logs: {str(e)}")
-                    logger.info(f"Validation completed (logs will be updated next run)")
-            
+            logger.info(
+                f"[OK] {dataset_name.title()} validation passed for {len(df)} rows"
+            )
         except Exception as e:
             logger.error(f"Error validating {dataset_name}: {str(e)}", exc_info=True)
             return False
@@ -289,21 +257,21 @@ def main():
     # PURPOSE: Calculate league standings at multiple points in time
     #
     # PROCESS:
-    # 1. Iterate through 39 Mondays (Aug 25, 2025 to May 18, 2026)
+    # 1. Iterate through 38 Mondays (Aug 25, 2025 to May 11, 2026)
     # 2. For each Monday:
     #    a. Filter matches played up to that date
     #    b. Calculate standings (wins, losses, draws, points)
     #    c. Rank teams by points, goal difference, etc.
     # 3. Aggregate all snapshots into one file
     #
-    # OUTPUT: outputs/standings_historical.csv (780 rows)
-    #         39 Mondays × 20 teams per Monday
+    # OUTPUT: outputs/standings_historical.csv (760 rows)
+    #         38 Mondays × 20 teams per Monday
     # ════════════════════════════════════════════════════════════════════════════
     logger.info("\n" + "="*80)
     logger.info("STEP 2: HISTORICAL STANDINGS SIMULATION")
     logger.info("="*80)
-    logger.info("Simulating weekly pipeline runs from Aug 25, 2025 to May 18, 2026")
-    logger.info("Status: 39 Monday snapshots x 20 teams = 780 historical records")
+    logger.info("Simulating weekly pipeline runs from Aug 25, 2025 to May 11, 2026")
+    logger.info("Status: 38 Monday snapshots x 20 teams = 760 historical records")
     
     try:
         historical_pipeline = HistoricalStandingsPipeline()
@@ -413,7 +381,7 @@ def main():
     logger.info("  |- logs/validation/scores_validation_summary.csv")
     logger.info("  |- logs/validation/scores_validation_full.csv")
     logger.info("\nHistorical Standings (STEP 2):")
-    logger.info("  |- outputs/standings_historical.csv (780 rows, 39 weekly snapshots)")
+    logger.info("  |- outputs/standings_historical.csv (760 rows, 38 weekly snapshots)")
     logger.info("  |- logs/standings/standings_historical.log")
     logger.info("\nFinal Standings (STEP 3):")
     logger.info("  |- outputs/standings_final.csv (20 teams, final rankings)")

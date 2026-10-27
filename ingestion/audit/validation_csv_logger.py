@@ -31,12 +31,26 @@ class ValidationCSVLogger:
 
         self.summary_path = self.log_dir / f"{dataset_name}_validation_summary.csv"
         self.full_path = self.log_dir / f"{dataset_name}_validation_full.csv"
+        self.quarantine_path = self.log_dir / f"{dataset_name}_quarantine.csv"
 
     # -----------------------------------------------------
     def log(self, results: List[Dict[str, Any]], run_ts: pd.Timestamp, validation_stage: str = "post-remediation"):
         self._write_full_logs(results, run_ts, validation_stage)
         summary_df = self._write_summary_logs(results, run_ts, validation_stage)
         return summary_df
+
+    def log_quarantine(self, rows: pd.DataFrame, run_ts: pd.Timestamp) -> None:
+        audit_rows = rows.copy()
+        audit_rows["quarantined_at"] = run_ts
+        audit_rows.to_csv(
+            self.quarantine_path,
+            mode="a",
+            index=False,
+            header=(
+                not self.quarantine_path.exists()
+                or self.quarantine_path.stat().st_size == 0
+            ),
+        )
 
     # -----------------------------------------------------
     def _write_full_logs(self, results, run_ts, validation_stage: str):

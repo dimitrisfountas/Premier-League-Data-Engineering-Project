@@ -1,195 +1,215 @@
-import sys
-from pathlib import Path
+from __future__ import annotations
 
-# Add parent directory to path to allow imports from root
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from pathlib import Path
+from typing import Any
 
 import pandas as pd
+
+from constants import expected_columns, valid_teams
+from ingestion.audit.validation_csv_logger import ValidationCSVLogger
 from ingestion.csv_ingestor import CSVIngestor
 from ingestion.quality.ge_schedule_expectations import ScheduleQA
 from ingestion.quality.ge_scores_expectations import ScoresQA
-from ingestion.audit.validation_csv_logger import ValidationCSVLogger
-from constants import expected_columns, valid_teams
 
-# --------------------------------------------------------
-# Data Pipeline Class (Read, Normalize, Validate, Log)
-#--------------------------------------------------------
+
+class DataQualityError(RuntimeError):
+    """Raised when critical Great Expectations checks remain unsuccessful."""
+
 
 class DataPipelineCSV:
-    """
-    End-to-end pipeline for:
-    - CSV ingestion
-    - Light normalization
-    - Data quality validation (Great Expectations)
-    - Append-only validation logging (CSV)
+    """Ingest, validate, remediate known score issues, and audit the result."""
 
-    This pipeline is intentionally simple and explicit.
-    """
-
-    def __init__(self, dataset_name: str, enable_remediation: bool = False):
+    def __init__(
+        self,
+        dataset_name: str,
+        enable_remediation: bool = False,
+        schedule_game_ids: set[str] | None = None,
+        log_dir: str | Path = "logs/validation",
+    ):
         self.dataset_name = dataset_name
         self.enable_remediation = enable_remediation
-
-        # Runtime state
-        self.df = None
-        self.results = []
-
-        # Single timestamp per pipeline run (lineage-safe)
+        self.schedule_game_ids = schedule_game_ids
+        self.df: pd.DataFrame | None = None
+        self.results: list[dict[str, Any]] = []
         self.run_ts = pd.Timestamp.now(tz="UTC")
+        self.logger = ValidationCSVLogger(dataset_name, log_dir=str(log_dir))
 
-        # Validation logger (audit layer)
-        self.logger = ValidationCSVLogger(dataset_name)
-
-    # --------------------------------------------------------
-    # Step 1: Ingest and normalize raw CSV data
-    # --------------------------------------------------------
-    def ingest_and_normalize(self):
+    def ingest_and_normalize(self) -> pd.DataFrame:
         ingestor = CSVIngestor(self.dataset_name)
-
-        # Raw CSV read + batch metadata capture
         ingestor.read_csv()
-        
-        # Light deterministic cleanup (no validation here)
         ingestor.normalize()
-
-        # Attach batch-level metadata to dataframe
         ingestor.assign_batch_metadata()
-
         self.df = ingestor.get_dataframe()
-        
         return self.df
 
-    # --------------------------------------------------------
-    # Step 2: Run data quality validations (bronze contract)
-    # --------------------------------------------------------
-    def run_validations(self):
+    def run_validations(
+        self, validation_stage: str = "validation"
+    ) -> list[dict[str, Any]]:
         if self.df is None:
             raise ValueError("DataFrame not loaded. Run ingest_and_normalize first.")
 
-        # Reset results each run to avoid duplicates
-        self.results = []
-
+        docs_dir = (
+            self.logger.log_dir
+            / "data_docs"
+            / self.dataset_name
+            / f"{validation_stage}_{self.run_ts.strftime('%Y%m%dT%H%M%SZ')}"
+        )
         if self.dataset_name == "schedule":
-            print("Running schedule validations...")
-            self.results = ScheduleQA(
+            validator = ScheduleQA(
                 self.df,
-                expected_columns=expected_columns[self.dataset_name],
-                valid_teams=valid_teams
-            ).run_all_checks()
+                expected_columns=expected_columns["schedule"],
+                valid_teams=valid_teams,
+                data_docs_dir=docs_dir,
+            )
         elif self.dataset_name == "scores":
-            print(f"Running scores validations...")
-            self.results = ScoresQA(
+            if self.schedule_game_ids is None:
+                raise ValueError(
+                    "schedule_game_ids are required to validate score references."
+                )
+            validator = ScoresQA(
                 self.df,
-                expected_columns=expected_columns[self.dataset_name]
-            ).run_all_checks()
+                expected_columns=expected_columns["scores"],
+                schedule_game_ids=self.schedule_game_ids,
+                data_docs_dir=docs_dir,
+            )
         else:
             raise ValueError(f"Unknown dataset: {self.dataset_name}")
 
+        self.results = validator.run_all_checks()
         return self.results
 
-
-    # --------------------------------------------------------
-    # Step 3: Handle failed expectations (remediation)
-    # --------------------------------------------------------
-    def handle_failed_expectations(self):
-        """
-        Apply remediation logic based on failed validation results.
-        - Drop rows with nulls
-        - Remove duplicate game_ids (keep first occurrence)
-        """
+    def handle_failed_expectations(self) -> pd.DataFrame:
+        """Apply score-specific policies and append removed rows to the audit log."""
         if self.df is None:
             raise ValueError("DataFrame not loaded. Run ingest_and_normalize first.")
-        
-        initial_rows = len(self.df)
-        
-        # Check for null values and drop rows with any nulls
-        nulls_check = next((r for r in self.results if "not_be_null" in r.get("expectation", "")), None)
-        if nulls_check and not nulls_check["success"]:
-            print(f"Dropping rows with null values...")
-            self.df = self.df.dropna()
-            rows_after_nulls = len(self.df)
-            print(f"  Dropped {initial_rows - rows_after_nulls} rows with nulls")
-        
-        # Check for duplicate game_ids and keep only first occurrence
-        duplicates_check = next((r for r in self.results if "game_id" in r.get("expectation", "") and "unique" in r.get("expectation", "")), None)
-        if duplicates_check and not duplicates_check["success"]:
-            print(f"Removing duplicate game_ids (keeping first occurrence)...")
-            rows_before_dedup = len(self.df)
-            self.df = self.df.drop_duplicates(subset=["game_id"], keep="first")
-            print(f"  Removed {rows_before_dedup - len(self.df)} duplicate rows")
-        
+        if self.dataset_name != "scores":
+            return self.df
+        if self.schedule_game_ids is None:
+            raise ValueError(
+                "schedule_game_ids are required before score remediation."
+            )
+
+        score_columns = ["home_goals", "away_goals"]
+        required_columns = {"game_id", *score_columns}
+        missing_columns = required_columns - set(self.df.columns)
+        if missing_columns:
+            raise DataQualityError(
+                "Cannot remediate scores with missing required columns: "
+                + ", ".join(sorted(missing_columns))
+            )
+
+        quarantine: dict[Any, str] = {}
+        # A duplicate is only safe to collapse if its non-null goal values agree.
+        # Conflicting outcomes quarantine the whole fixture group for review.
+        for _, group in self.df.groupby("game_id", dropna=False, sort=False):
+            if len(group) < 2:
+                continue
+
+            complete = group[score_columns].notna().all(axis=1)
+            complete_rows = group.loc[complete]
+            complete_pairs = {
+                tuple(row)
+                for row in complete_rows[score_columns].itertuples(
+                    index=False, name=None
+                )
+            }
+
+            if len(complete_pairs) > 1:
+                for index in group.index:
+                    quarantine[index] = "conflicting_duplicate_game_id"
+                continue
+            if complete_rows.empty:
+                continue
+
+            canonical_score = next(iter(complete_pairs))
+            partial_conflict = any(
+                pd.notna(row[column]) and row[column] != canonical_score[position]
+                for _, row in group[score_columns].iterrows()
+                for position, column in enumerate(score_columns)
+            )
+            if partial_conflict:
+                for index in group.index:
+                    quarantine[index] = "conflicting_duplicate_game_id"
+                continue
+
+            winner_index = complete_rows.index[0]
+            for index in group.index:
+                if index == winner_index:
+                    continue
+                # Prefer the complete record only when partial duplicate values
+                # agree with it; otherwise the group was quarantined above.
+                quarantine[index] = (
+                    "duplicate_game_id_same_score"
+                    if bool(complete.loc[index])
+                    else "incomplete_duplicate_superseded_by_complete_score"
+                )
+
+        remaining = self.df.drop(index=list(quarantine))
+        # The schedule is authoritative: scores without a fixture are excluded,
+        # and missing scores are quarantined rather than silently dropped.
+        for index, row in remaining.iterrows():
+            game_id = row["game_id"]
+            if pd.isna(game_id):
+                quarantine[index] = "missing_game_id"
+            elif str(game_id) not in self.schedule_game_ids:
+                quarantine[index] = "orphan_score_game_id"
+            elif row[score_columns].isna().any():
+                quarantine[index] = "missing_required_score"
+
+        if quarantine:
+            quarantined = self.df.loc[list(quarantine)].copy()
+            quarantined["quarantine_reason"] = [
+                quarantine[index] for index in quarantined.index
+            ]
+            self.logger.log_quarantine(quarantined, run_ts=self.run_ts)
+            self.df = self.df.drop(index=list(quarantine)).copy()
         return self.df
 
-    # --------------------------------------------------------
-    # Step 4: Persist validation logs (append-only)
-    # --------------------------------------------------------
-    def run_pipeline(self):
-        # Ingestion + normalization
+    def run_pipeline(
+        self,
+    ) -> tuple[pd.DataFrame, list[dict[str, Any]], pd.DataFrame]:
         self.ingest_and_normalize()
-        
-        # Data quality checks (first pass)
-        print("\n" + "="*60)
-        if self.enable_remediation:
-            print("VALIDATION PASS 1: Before Remediation")
-        else:
-            print("VALIDATION: Data Quality Check")
-        print("="*60)
-        self.run_validations()
+        initial_stage = "pre-remediation" if self.enable_remediation else "validation"
+        self.run_validations(validation_stage=initial_stage)
         results_before = self.results.copy()
-        
-        # Log pre-remediation results
-        validation_stage = "pre-remediation" if self.enable_remediation else "validation"
-        self.logger.log(
+        summary_df = self.logger.log(
             results=results_before,
             run_ts=self.run_ts,
-            validation_stage=validation_stage
+            validation_stage=initial_stage,
         )
-        
-        # Check if there are actual failures to remediate
-        has_failures = any(not r["success"] for r in results_before)
-        
-        # Handle failed expectations (remediation) - only if enabled AND failures exist
+
+        has_failures = any(not result["success"] for result in results_before)
         if self.enable_remediation and has_failures:
-            print("\n" + "="*60)
-            print("REMEDIATION: Handling Failed Expectations")
-            print("="*60)
             self.handle_failed_expectations()
-            
-            # Data quality checks (second pass - after remediation)
-            print("\n" + "="*60)
-            print("VALIDATION PASS 2: After Remediation")
-            print("="*60)
-            self.run_validations()
+            self.run_validations(validation_stage="post-remediation")
             results_after = self.results.copy()
-            
-            # Log post-remediation results
             summary_df = self.logger.log(
                 results=results_after,
                 run_ts=self.run_ts,
-                validation_stage="post-remediation"
+                validation_stage="post-remediation",
             )
-            
-            # Compare results
-            print("\n" + "="*60)
-            print("IMPROVEMENT SUMMARY")
-            print("="*60)
-            failed_before = sum(1 for r in results_before if not r["success"])
-            failed_after = sum(1 for r in results_after if not r["success"])
+            failed_before = sum(not result["success"] for result in results_before)
+            failed_after = sum(not result["success"] for result in results_after)
             print(f"Failed expectations before remediation: {failed_before}")
             print(f"Failed expectations after remediation: {failed_after}")
-            print(f"Improvements: {failed_before - failed_after}")
+            results_to_enforce = results_after
         else:
-            if self.enable_remediation:
-                print("\n" + "="*60)
-                print("REMEDIATION: Not needed - all tests passed")
-                print("="*60)
-            summary_df = self.logger.log(
-                results=results_before,
-                run_ts=self.run_ts,
-                validation_stage="validation"
+            results_to_enforce = results_before
+
+        # Do not let downstream analytics consume a dataset with unresolved
+        # critical GX failures, even if a remediation pass was requested.
+        critical_failures = [
+            result["expectation"]
+            for result in results_to_enforce
+            if not result["success"]
+            and result.get("severity", "critical") == "critical"
+        ]
+        if critical_failures:
+            raise DataQualityError(
+                f"Critical {self.dataset_name} validation failures remain: "
+                + ", ".join(critical_failures)
             )
 
-        # Return dataframe, raw results, and formatted summary
+        if self.df is None:
+            raise RuntimeError("The pipeline completed without an ingested DataFrame.")
         return self.df, self.results, summary_df
-
-# --------------------------------------------------------

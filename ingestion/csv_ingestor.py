@@ -211,8 +211,10 @@ class CSVIngestor:
             raise ValueError("Dataframe not loaded. Call read_csv() first.")
 
         if self.source == "schedule":
-            self.df["home_team"] = self.df["home_team"].astype(str).str.strip().str.title()
-            self.df["away_team"] = self.df["away_team"].astype(str).str.strip().str.title()
+            # Keep nulls as nulls so Great Expectations can detect them rather
+            # than converting them into literal strings such as "Nan".
+            self.df["home_team"] = self.df["home_team"].str.strip().str.title()
+            self.df["away_team"] = self.df["away_team"].str.strip().str.title()
 
         return self.df
 
