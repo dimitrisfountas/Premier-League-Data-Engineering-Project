@@ -98,6 +98,8 @@ project configuration is required.
 Suite results, including the GX expectation configuration, severity,
 unexpected values, and exception details, are retained in the append-only CSV
 audit logs. GX Data Docs are built under `logs/validation/data_docs/`.
+Open `logs/validation/data_docs/index.html` in a browser for the single native
+GX Data Docs site containing all suites and validation results from the run.
 
 #### Schedule Validation: `ge_schedule_expectations.py` → `ScheduleQA`
 

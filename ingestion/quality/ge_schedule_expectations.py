@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ class ScheduleQA(BaseQA):
     def __init__(
         self,
         df: pd.DataFrame,
-        expected_columns: set[str],
+        expected_columns: Iterable[str],
         valid_teams: set[str],
         data_docs_dir: str | Path | None = None,
     ):

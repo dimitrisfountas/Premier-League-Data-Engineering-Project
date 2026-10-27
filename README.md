@@ -133,7 +133,10 @@ logs/validation/
 ├── scores_validation_summary.csv      (Passed/Failed counts)
 ├── scores_validation_full.csv         (Detailed results)
 ├── scores_quarantine.csv              (Rows excluded with remediation reasons)
-└── data_docs/                         (Great Expectations HTML reports per suite/run)
+└── data_docs/
+    ├── index.html                     (Single native GX Data Docs site)
+    ├── expectations/                   (Expectation suites)
+    └── validations/                    (Successful and failed validation results)
 ```
 
 **Sample Validation Summary**:
@@ -563,7 +566,18 @@ Only file logs (no console spam).
 | Validation logs (4 files) | Varies | Great Expectations audit trail |
 | scores_quarantine.csv | Varies | Rows excluded with auditable reasons |
 
-Great Expectations HTML Data Docs are generated under `logs/validation/data_docs/`.
+Great Expectations Data Docs are GX Core's built-in HTML documentation. One
+native site contains all expectation suites and validation results from the
+pipeline run. To view it with working report links, serve the generated site
+over localhost from the project root:
+
+```powershell
+.\.venv\Scripts\python.exe -m http.server 8765 --directory .\logs\validation\data_docs
+```
+
+Then open `http://localhost:8765/` in your browser. Press `Ctrl+C` in the
+terminal to stop the local server. Serving over HTTP avoids browser restrictions
+that can break links when opening nested reports directly with `file://`.
 
 ---
 

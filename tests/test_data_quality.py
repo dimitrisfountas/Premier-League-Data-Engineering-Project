@@ -68,10 +68,27 @@ class GreatExpectationsTests(unittest.TestCase):
         schema_result = next(
             result
             for result in results
-            if result["expectation"] == "expect_table_columns_to_match_set"
+            if result["expectation"]
+            == "expect_table_columns_to_match_ordered_list"
         )
         self.assertFalse(schema_result["success"])
         self.assertEqual(schema_result["severity"], "critical")
+
+    def test_column_order_is_primary_key_then_related_fields(self) -> None:
+        frame = make_scores([("fixture-1", 1, 0)])
+        results = ScoresQA(
+            frame,
+            expected_columns=expected_columns["scores"],
+            schedule_game_ids={"fixture-1"},
+        ).run_all_checks()
+
+        schema_result = next(
+            result
+            for result in results
+            if result["expectation"]
+            == "expect_table_columns_to_match_ordered_list"
+        )
+        self.assertTrue(schema_result["success"])
 
     def test_null_goals_fail_gx_and_are_audited_when_quarantined(self) -> None:
         frame = make_scores([("fixture-1", None, 0)])
@@ -253,13 +270,47 @@ class PipelineOutputTests(unittest.TestCase):
                 ["750ba4567999ebd97nv18424d81bf412lz"],
             )
 
-            data_docs = list(
-                (work / "logs/validation/data_docs").rglob("index.html")
+            docs_index = work / "logs/validation/data_docs/index.html"
+            self.assertTrue(docs_index.is_file())
+            docs_html = docs_index.read_text(encoding="utf-8")
+            for report in (
+                "premier_league_schedule",
+                "premier_league_team_round_appearances",
+                "premier_league_scores_scores_pre_remediation",
+                "premier_league_scores_scores_post_remediation",
+            ):
+                self.assertIn(report, docs_html)
+            self.assertIn("Expectation Suites", docs_html)
+            self.assertIn("Validation", docs_html)
+            self.assertEqual(
+                len(list((docs_index.parent / "validations").rglob("*.html"))),
+                4,
             )
-            self.assertGreaterEqual(len(data_docs), 4)
-            self.assertTrue(
-                all("<html" in path.read_text(encoding="utf-8").lower()
-                    for path in data_docs)
+            self.assertEqual(
+                len(list((docs_index.parent / "expectations").glob("*.html"))),
+                4,
+            )
+            pre_remediation_report = next(
+                path
+                for path in (docs_index.parent / "validations").rglob("*.html")
+                if any(
+                    "scores_pre_remediation" in parent.name
+                    for parent in path.parents
+                )
+            )
+            report_html = pre_remediation_report.read_text(encoding="utf-8")
+            toc_html = report_html.split(
+                "<strong>Table of Contents</strong>", maxsplit=1
+            )[1].split("</nav>", maxsplit=1)[0]
+            ordered_columns = (
+                "game_id",
+                "home_goals",
+                "away_goals",
+                "ingestion_time",
+            )
+            self.assertEqual(
+                sorted(ordered_columns, key=toc_html.index),
+                list(ordered_columns),
             )
 
 
